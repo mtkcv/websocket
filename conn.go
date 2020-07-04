@@ -1185,6 +1185,73 @@ func (c *Conn) SetCompressionLevel(level int) error {
 	return nil
 }
 
+// NextFrameReader returns the next frame received from the peer. The
+// returned messageType is either TextMessage or BinaryMessage.
+//
+// There can be at most one open reader on a connection. NextFrameReader discards
+// the previous message if the application has not already consumed it.
+//
+// Applications must break out of the application's read loop when this method
+// returns a non-nil error value. Errors returned from this method are
+// permanent. Once this method returns a non-nil error, all subsequent calls to
+// this method return the same error.
+func (c *Conn) NextFrameReader() (messageType int, r io.Reader, err error) {
+	// Close previous reader, only relevant for decompression.
+	if c.reader != nil {
+		c.reader.Close()
+		c.reader = nil
+	}
+
+	c.messageReader = nil
+	c.readLength = 0
+
+	for c.readErr == nil {
+		frameType, err := c.advanceFrame()
+		if err != nil {
+			c.readErr = hideTempErr(err)
+			break
+		}
+
+		if frameType == TextMessage || frameType == BinaryMessage ||
+			//I used epoll or kqueue, so I want to read even ping or pong messages
+			frameType == PingMessage || frameType == PongMessage {
+			c.messageReader = &messageReader{c}
+			c.reader = c.messageReader
+			if c.readDecompress {
+				c.reader = c.newDecompressionReader(c.reader)
+			}
+			return frameType, c.reader, nil
+		} else if frameType == CloseMessage {
+			return frameType, nil, nil
+		}
+	}
+
+	// Applications that do handle the error returned from this method spin in
+	// tight loop on connection failure. To help application developers detect
+	// this error, panic on repeated reads to the failed connection.
+	c.readErrCount++
+	if c.readErrCount >= 1000 {
+		panic("repeated read on failed websocket connection")
+	}
+
+	return noFrame, nil, c.readErr
+}
+
+// ReadFrame is a helper method for getting a reader using NextReader and
+// reading from that reader to a buffer. You can read control frame or data frame
+func (c *Conn) ReadFrame() (messageType int, p []byte, err error) {
+	var r io.Reader
+	messageType, r, err = c.NextFrameReader()
+	if err != nil {
+		return messageType, nil, err
+	}
+	if r == nil {
+		return messageType, []byte{}, err
+	}
+	p, err = ioutil.ReadAll(r)
+	return messageType, p, err
+}
+
 // FormatCloseMessage formats closeCode and text as a WebSocket close message.
 // An empty message is returned for code CloseNoStatusReceived.
 func FormatCloseMessage(closeCode int, text string) []byte {
