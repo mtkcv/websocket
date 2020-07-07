@@ -1185,6 +1185,173 @@ func (c *Conn) SetCompressionLevel(level int) error {
 	return nil
 }
 
+func (c *Conn) advanceAllFrame() (int, error) {
+	// 1. Skip remainder of previous frame.
+
+	if c.readRemaining > 0 {
+		if _, err := io.CopyN(ioutil.Discard, c.br, c.readRemaining); err != nil {
+			return noFrame, err
+		}
+	}
+
+	// 2. Read and parse first two bytes of frame header.
+
+	p, err := c.read(2)
+	if err != nil {
+		return noFrame, err
+	}
+
+	final := p[0]&finalBit != 0
+	frameType := int(p[0] & 0xf)
+	mask := p[1]&maskBit != 0
+	c.setReadRemaining(int64(p[1] & 0x7f))
+
+	c.readDecompress = false
+	if c.newDecompressionReader != nil && (p[0]&rsv1Bit) != 0 {
+		c.readDecompress = true
+		p[0] &^= rsv1Bit
+	}
+
+	if rsv := p[0] & (rsv1Bit | rsv2Bit | rsv3Bit); rsv != 0 {
+		return noFrame, c.handleProtocolError("unexpected reserved bits 0x" + strconv.FormatInt(int64(rsv), 16))
+	}
+
+	switch frameType {
+	case CloseMessage, PingMessage, PongMessage:
+		if c.readRemaining > maxControlFramePayloadSize {
+			return noFrame, c.handleProtocolError("control frame length > 125")
+		}
+		if !final {
+			return noFrame, c.handleProtocolError("control frame not final")
+		}
+	case TextMessage, BinaryMessage:
+		if !c.readFinal {
+			return noFrame, c.handleProtocolError("message start before final message frame")
+		}
+		c.readFinal = final
+	case continuationFrame:
+		if c.readFinal {
+			return noFrame, c.handleProtocolError("continuation after final message frame")
+		}
+		c.readFinal = final
+	default:
+		return noFrame, c.handleProtocolError("unknown opcode " + strconv.Itoa(frameType))
+	}
+
+	// 3. Read and parse frame length as per
+	// https://tools.ietf.org/html/rfc6455#section-5.2
+	//
+	// The length of the "Payload data", in bytes: if 0-125, that is the payload
+	// length.
+	// - If 126, the following 2 bytes interpreted as a 16-bit unsigned
+	// integer are the payload length.
+	// - If 127, the following 8 bytes interpreted as
+	// a 64-bit unsigned integer (the most significant bit MUST be 0) are the
+	// payload length. Multibyte length quantities are expressed in network byte
+	// order.
+
+	switch c.readRemaining {
+	case 126:
+		p, err := c.read(2)
+		if err != nil {
+			return noFrame, err
+		}
+
+		if err := c.setReadRemaining(int64(binary.BigEndian.Uint16(p))); err != nil {
+			return noFrame, err
+		}
+	case 127:
+		p, err := c.read(8)
+		if err != nil {
+			return noFrame, err
+		}
+
+		if err := c.setReadRemaining(int64(binary.BigEndian.Uint64(p))); err != nil {
+			return noFrame, err
+		}
+	}
+
+	// 4. Handle frame masking.
+
+	if mask != c.isServer {
+		return noFrame, c.handleProtocolError("incorrect mask flag")
+	}
+
+	if mask {
+		c.readMaskPos = 0
+		p, err := c.read(len(c.readMaskKey))
+		if err != nil {
+			return noFrame, err
+		}
+		copy(c.readMaskKey[:], p)
+	}
+
+	// 5. For text and binary messages, enforce read limit and return.
+
+	if frameType == continuationFrame || frameType == TextMessage || frameType == BinaryMessage {
+
+		c.readLength += c.readRemaining
+		// Don't allow readLength to overflow in the presence of a large readRemaining
+		// counter.
+		if c.readLength < 0 {
+			return noFrame, ErrReadLimit
+		}
+
+		if c.readLimit > 0 && c.readLength > c.readLimit {
+			c.WriteControl(CloseMessage, FormatCloseMessage(CloseMessageTooBig, ""), time.Now().Add(writeWait))
+			return noFrame, ErrReadLimit
+		}
+
+		return frameType, nil
+	}
+
+	// 6. Read control frame payload.
+
+	var payload []byte
+	if c.readRemaining > 0 {
+		payload, err = c.read(int(c.readRemaining))
+		c.setReadRemaining(0)
+		if err != nil {
+			return noFrame, err
+		}
+		if c.isServer {
+			maskBytes(c.readMaskKey, 0, payload)
+		}
+	}
+
+	// 7. Process control frame payload.
+
+	switch frameType {
+	case PongMessage:
+		if err := c.handlePong(string(payload)); err != nil {
+			return noFrame, err
+		}
+	case PingMessage:
+		if err := c.handlePing(string(payload)); err != nil {
+			return noFrame, err
+		}
+	case CloseMessage:
+		closeCode := CloseNoStatusReceived
+		closeText := ""
+		if len(payload) >= 2 {
+			closeCode = int(binary.BigEndian.Uint16(payload))
+			if !isValidReceivedCloseCode(closeCode) {
+				return noFrame, c.handleProtocolError("invalid close code")
+			}
+			closeText = string(payload[2:])
+			if !utf8.ValidString(closeText) {
+				return noFrame, c.handleProtocolError("invalid utf8 payload in close frame")
+			}
+		}
+		if err := c.handleClose(closeCode, closeText); err != nil {
+			return noFrame, err
+		}
+		return frameType, &CloseError{Code: closeCode, Text: closeText}
+	}
+
+	return frameType, nil
+}
+
 // NextFrameReader returns the next frame received from the peer. The
 // returned messageType is either TextMessage or BinaryMessage.
 //
@@ -1206,10 +1373,14 @@ func (c *Conn) NextFrameReader() (messageType int, r io.Reader, err error) {
 	c.readLength = 0
 
 	for c.readErr == nil {
-		frameType, err := c.advanceFrame()
-		if err != nil {
-			c.readErr = hideTempErr(err)
-			break
+		frameType, err := c.advanceAllFrame()
+		//CloseError represents a close message.
+		_, ok := err.(*CloseError)
+		if !ok {
+			if err != nil {
+				c.readErr = hideTempErr(err)
+				break
+			}
 		}
 
 		if frameType == TextMessage || frameType == BinaryMessage ||
@@ -1222,6 +1393,7 @@ func (c *Conn) NextFrameReader() (messageType int, r io.Reader, err error) {
 			}
 			return frameType, c.reader, nil
 		} else if frameType == CloseMessage {
+			//need to close tcp conn
 			return frameType, nil, nil
 		}
 	}
@@ -1238,7 +1410,7 @@ func (c *Conn) NextFrameReader() (messageType int, r io.Reader, err error) {
 }
 
 // ReadFrame is a helper method for getting a reader using NextReader and
-// reading from that reader to a buffer. You can read control frame or data frame
+// reading from that reader to a buffer. You can read control frame or data frame.
 func (c *Conn) ReadFrame() (messageType int, p []byte, err error) {
 	var r io.Reader
 	messageType, r, err = c.NextFrameReader()
